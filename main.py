@@ -1,32 +1,36 @@
-# requirements.txt
 """
-gradio>=4.0.0
-python-docx>=0.8.11
-Pillow>=10.0.0
-paddleocr>=2.7.0
-paddlepaddle>=2.5.0
-requests>=2.31.0
-opencv-python>=4.8.0
+BMC RAS测试报告深度分析系统 - PyQt6桌面版
+支持三轮AI推理 + 跨测试关联分析
 """
 
-# main.py
-import gradio as gr
-import docx
-from paddleocr import PaddleOCR
-import requests
-import tempfile
-import shutil
+import sys
 import os
 import json
 import re
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, asdict
-from enum import Enum
+import tempfile
+import shutil
 import traceback
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
+    QProgressBar, QGroupBox, QSpinBox, QMessageBox, QTabWidget,
+    QSplitter, QComboBox, QStatusBar
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont, QTextCursor, QIcon
+
+import docx
+from paddleocr import PaddleOCR
+import requests
 
 
 class ComponentType(Enum):
-    """部件类型枚举"""
+    """部件类型"""
     CPU = "CPU"
     MEMORY = "Memory"
     PCIE = "PCIe"
@@ -35,7 +39,7 @@ class ComponentType(Enum):
 
 
 class ErrorType(Enum):
-    """错误类型枚举"""
+    """错误类型"""
     CORRECTABLE = "Correctable"
     UNCORRECTABLE = "Uncorrectable"
     FATAL = "Fatal"
@@ -48,15 +52,12 @@ class TestCase:
     title: str
     component: ComponentType
     error_type: ErrorType
-    test_result: str  # PASS/FAIL
+    test_result: str
     raw_text: str
     ocr_images: List[Dict]
     register_values: Dict[str, str] = None
     silk_screen: str = None
-    error_log: str = None
-    diagnostic_info: str = None
-    position_info: str = None
-    
+
     def __post_init__(self):
         if self.register_values is None:
             self.register_values = {}
@@ -64,595 +65,770 @@ class TestCase:
             self.ocr_images = []
 
 
-class BMCRASKnowledgeBase:
-    """BMC RAS专业知识库"""
-    
-    REGISTER_PATTERNS = {
-        'CPU': {
-            'MCA_BANKS': r'MCA_BANK\d+',
-            'MCi_STATUS': r'MCi_STATUS.*?0x[0-9a-fA-F]+',
-            'MCi_ADDR': r'MCi_ADDR.*?0x[0-9a-fA-F]+',
-        },
-        'Memory': {
-            'DIMM_SLOT': r'DIMM[A-Z]?\d+',
-            'CE_COUNT': r'CE.*?count.*?\d+',
-            'UE_COUNT': r'UE.*?count.*?\d+',
-        },
-        'PCIe': {
-            'BDF': r'[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]',
-            'AER': r'AER.*?register',
-        }
-    }
-    
-    EXPECTED_FIELDS = {
-        'CPU': ['MCA Bank', 'Error Type', 'MCi_STATUS', 'Processor ID'],
-        'Memory': ['DIMM Slot', 'Error Address', 'CE/UE Count', 'ECC Status'],
-        'PCIe': ['BDF', 'AER Status', 'Device ID'],
-        'SATA': ['Port Number', 'Device Status', 'Error Log'],
-    }
+class BMCRASAnalyzer:
+    """BMC RAS分析器核心"""
 
-
-class EnhancedTestReportAnalyzer:
-    def __init__(self, ollama_url: str = "http://localhost:11434/api/generate", 
-                 model_name: str = "qwen2.5:7b"):
-        try:
-            self.ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
-        except Exception as e:
-            print(f"OCR初始化警告: {e}")
-            self.ocr = PaddleOCR(lang='ch', show_log=False)
-        
-        self.ollama_url = ollama_url
+    def __init__(self, model_name: str = "qwen3:8b", ollama_url: str = "http://localhost:11434/api/generate"):
         self.model_name = model_name
-        self.knowledge_base = BMCRASKnowledgeBase()
-        
+        self.ollama_url = ollama_url
+
+        # 初始化OCR
+        try:
+            self.ocr = PaddleOCR(use_angle_cls=True, lang='ch')
+        except:
+            self.ocr = PaddleOCR(lang='ch')
+
     def extract_images_from_docx(self, doc_path: str, output_dir: str) -> List[Tuple[str, int]]:
-        """从Word文档中提取图片"""
+        """从Word文档提取图片"""
         doc = docx.Document(doc_path)
         image_list = []
         os.makedirs(output_dir, exist_ok=True)
-        
+
         for rel in doc.part.rels.values():
             if "image" in rel.target_ref:
                 img_data = rel.target_part.blob
                 img_name = os.path.basename(rel.target_ref)
                 img_path = os.path.join(output_dir, img_name)
-                
+
                 with open(img_path, 'wb') as f:
                     f.write(img_data)
-                
+
                 para_index = self._find_image_paragraph(doc, rel.rId)
                 image_list.append((img_path, para_index))
-        
+
         return sorted(image_list, key=lambda x: x[1])
-    
+
     def _find_image_paragraph(self, doc, rel_id: str) -> int:
-        for idx, paragraph in enumerate(doc.paragraphs):
-            if rel_id in paragraph._element.xml:
+        for idx, para in enumerate(doc.paragraphs):
+            if rel_id in para._element.xml:
                 return idx
         return -1
-    
-    def ocr_images(self, image_paths: List[str], progress=None) -> Dict[str, Dict]:
-        """OCR识别图片"""
-        ocr_results = {}
-        
-        for idx, img_path in enumerate(image_paths):
-            if progress:
-                progress((idx + 1) / len(image_paths), 
-                        desc=f"OCR识别 {idx + 1}/{len(image_paths)}")
-            
+
+    def ocr_images(self, image_paths: List[str]) -> Dict[str, Dict]:
+        """OCR识别"""
+        results = {}
+        for img_path in image_paths:
             try:
                 result = self.ocr.ocr(img_path, cls=True)
                 text_lines = []
-                
+
                 if result and result[0]:
                     for line in result[0]:
                         if line and len(line) >= 2:
                             text_lines.append(line[1][0])
-                
+
                 full_text = "\n".join(text_lines)
-                
-                ocr_results[img_path] = {
+                results[img_path] = {
                     'text': full_text,
                     'lines': text_lines,
-                    'register_values': self._extract_registers(full_text),
-                    'silk_screen': self._extract_silk_screen(full_text),
+                    'registers': self._extract_registers(full_text),
+                    'silk_screen': self._extract_silk_screen(full_text)
                 }
-                
             except Exception as e:
-                ocr_results[img_path] = {
-                    'text': f"OCR失败: {str(e)}",
-                    'lines': [],
-                    'register_values': {},
-                    'silk_screen': None,
-                }
-        
-        return ocr_results
-    
+                results[img_path] = {'text': f'OCR失败: {str(e)}', 'lines': [], 'registers': {}, 'silk_screen': None}
+
+        return results
+
     def _extract_registers(self, text: str) -> Dict[str, str]:
-        """提取寄存器值"""
+        """提取寄存器"""
         registers = {}
         patterns = [
             r'(MCA_BANK\d+|MCi_\w+)\s*[=:]\s*(0x[0-9a-fA-F]+)',
             r'(DIMM[A-Z]?\d+)\s*[=:]\s*([^\s]+)',
             r'([A-Z_]+_REG(?:ISTER)?)\s*[=:]\s*(0x[0-9a-fA-F]+|\d+)',
         ]
-        
         for pattern in patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
                 registers[match[0]] = match[1]
-        
         return registers
-    
+
     def _extract_silk_screen(self, text: str) -> Optional[str]:
-        """提取丝印信息"""
+        """提取丝印"""
         patterns = [
             r'(silk.*?screen|丝印)[:\s]+([A-Z0-9_-]+)',
             r'(label|标签)[:\s]+([A-Z0-9_-]+)',
         ]
-        
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(2)
         return None
-    
+
     def parse_test_structure(self, doc_path: str) -> List[TestCase]:
-        """解析测试报告结构"""
+        """解析测试结构"""
         doc = docx.Document(doc_path)
         test_cases = []
         current_case = None
         current_text = []
-        
+
         for para in doc.paragraphs:
             text = para.text.strip()
             if not text:
                 continue
-            
-            is_test_title = self._is_test_case_title(text, para)
-            
-            if is_test_title:
+
+            is_title = self._is_test_title(text, para)
+
+            if is_title:
                 if current_case:
                     current_case.raw_text = "\n".join(current_text)
                     test_cases.append(current_case)
-                
+
                 current_case = TestCase(
                     title=text,
                     component=self._identify_component(text),
                     error_type=self._identify_error_type(text),
-                    test_result=self._extract_test_result(text),
+                    test_result=self._extract_result(text),
                     raw_text="",
                     ocr_images=[]
                 )
                 current_text = [text]
             elif current_case:
                 current_text.append(text)
-        
+
         if current_case:
             current_case.raw_text = "\n".join(current_text)
             test_cases.append(current_case)
-        
+
         return test_cases
-    
-    def _is_test_case_title(self, text: str, para) -> bool:
+
+    def _is_test_title(self, text: str, para) -> bool:
         is_heading = para.style.name.startswith('Heading')
         is_bold = para.runs and para.runs[0].bold if para.runs else False
-        has_keywords = any(kw in text.lower() for kw in 
-                          ['test', '测试', 'cpu', 'memory', 'pcie', 'sata', 'inject'])
+        has_keywords = any(k in text.lower() for k in ['test', '测试', 'cpu', 'memory', 'pcie', 'sata', 'inject'])
         return (is_heading or (is_bold and len(text) < 150)) and has_keywords
-    
+
     def _identify_component(self, text: str) -> ComponentType:
-        text_lower = text.lower()
-        if 'cpu' in text_lower or 'processor' in text_lower:
+        t = text.lower()
+        if 'cpu' in t or 'processor' in t:
             return ComponentType.CPU
-        elif 'mem' in text_lower or 'dimm' in text_lower:
+        elif 'mem' in t or 'dimm' in t:
             return ComponentType.MEMORY
-        elif 'pcie' in text_lower:
+        elif 'pcie' in t:
             return ComponentType.PCIE
-        elif 'sata' in text_lower or 'disk' in text_lower:
+        elif 'sata' in t or 'disk' in t:
             return ComponentType.SATA
         return ComponentType.OTHER
-    
+
     def _identify_error_type(self, text: str) -> ErrorType:
-        text_lower = text.lower()
-        if 'ce' in text_lower or 'correct' in text_lower:
+        t = text.lower()
+        if 'ce' in t or 'correct' in t:
             return ErrorType.CORRECTABLE
-        elif 'uce' in text_lower or 'uncorrect' in text_lower:
+        elif 'uce' in t or 'uncorrect' in t:
             return ErrorType.UNCORRECTABLE
-        elif 'fatal' in text_lower:
+        elif 'fatal' in t:
             return ErrorType.FATAL
         return ErrorType.OTHER
-    
-    def _extract_test_result(self, text: str) -> str:
+
+    def _extract_result(self, text: str) -> str:
         if 'pass' in text.lower():
             return "PASS"
         elif 'fail' in text.lower():
             return "FAIL"
         return "UNKNOWN"
-    
-    def integrate_ocr_to_testcases(self, test_cases: List[TestCase], 
-                                   image_list: List[Tuple[str, int]], 
-                                   ocr_results: Dict[str, Dict]) -> List[TestCase]:
-        """整合OCR结果到测试用例"""
+
+    def integrate_ocr(self, test_cases: List[TestCase], image_list, ocr_results) -> List[TestCase]:
+        """整合OCR结果"""
         for img_path, para_idx in image_list:
             ocr_data = ocr_results.get(img_path, {})
-            
-            for test_case in test_cases:
-                test_case.ocr_images.append({
-                    'path': img_path,
-                    'para_idx': para_idx,
-                    'ocr_data': ocr_data
-                })
-                
-                if ocr_data.get('register_values'):
-                    test_case.register_values.update(ocr_data['register_values'])
-                
-                if ocr_data.get('silk_screen') and not test_case.silk_screen:
-                    test_case.silk_screen = ocr_data['silk_screen']
-        
+            for tc in test_cases:
+                tc.ocr_images.append({'path': img_path, 'para_idx': para_idx, 'ocr_data': ocr_data})
+                if ocr_data.get('registers'):
+                    tc.register_values.update(ocr_data['registers'])
+                if ocr_data.get('silk_screen') and not tc.silk_screen:
+                    tc.silk_screen = ocr_data['silk_screen']
         return test_cases
-    
-    def extract_structured_info(self, test_case: TestCase) -> Dict:
-        """第一轮推理：提取结构化信息"""
-        prompt = f"""你是BMC RAS测试数据提取专家。从以下内容中提取关键信息。
 
-测试标题: {test_case.title}
-部件: {test_case.component.value}
-错误类型: {test_case.error_type.value}
-
-文本内容:
-{test_case.raw_text[:800]}
-
-OCR图片内容:
-"""
-        
-        for idx, img in enumerate(test_case.ocr_images[:2]):
-            ocr_text = img['ocr_data'].get('text', '')[:500]
-            prompt += f"\n图片{idx+1}:\n{ocr_text}\n"
-        
-        prompt += """
-请提取并以JSON格式输出:
-{
-    "registers": {"寄存器名": "值"},
-    "silk_screen": "丝印信息",
-    "error_log": "错误日志摘要",
-    "diagnosis": "诊断结果",
-    "position": "部件位置"
-}
-"""
-        
-        try:
-            response = self._call_ollama(prompt, timeout=120)
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            return {'raw_response': response}
-        except:
-            return {'error': '提取失败'}
-    
-    def analyze_single_testcase(self, test_case: TestCase, structured_info: Dict) -> Dict:
-        """第二轮推理：分析单个测试用例"""
-        prompt = f"""你是BMC RAS功能测试审查专家。审查以下测试用例。
-
-测试: {test_case.title}
-部件: {test_case.component.value}
-错误类型: {test_case.error_type.value}
-结果: {test_case.test_result}
-
-提取信息:
-{json.dumps(structured_info, indent=2, ensure_ascii=False)}
-
-原始文本:
-{test_case.raw_text[:600]}
-
-审查重点:
-1. 寄存器值是否正确？
-2. 丝印信息是否完整？
-3. 诊断结果是否准确？
-4. 错误日志是否完整？
-5. 部件位置是否准确？
-
-输出格式:
-**问题**: (如有)
-- [严重度] 具体问题描述
-**证据**: 支持数据
-**建议**: 改进建议
-
-无问题则输出: "未发现明显问题"
-"""
-        
-        try:
-            response = self._call_ollama(prompt, timeout=180)
-            return {
-                'test_case_title': test_case.title,
-                'analysis': response,
-                'has_issues': '未发现明显问题' not in response
-            }
-        except Exception as e:
-            return {
-                'test_case_title': test_case.title,
-                'analysis': f'分析失败: {str(e)}',
-                'has_issues': False
-            }
-    
-    def cross_testcase_analysis(self, test_cases: List[TestCase], 
-                               individual_analyses: List[Dict]) -> Dict:
-        """第三轮推理：跨测试用例关联分析"""
-        by_component = {}
-        for tc in test_cases:
-            comp = tc.component.value
-            if comp not in by_component:
-                by_component[comp] = []
-            by_component[comp].append(tc)
-        
-        prompt = f"""你是BMC RAS测试总体审查专家。进行关联分析。
-
-测试总数: {len(test_cases)}
-部件分布: {', '.join([f'{k}: {len(v)}个' for k, v in by_component.items()])}
-
-各部件概况:
-"""
-        
-        for comp, cases in list(by_component.items())[:5]:
-            prompt += f"\n{comp}:\n"
-            for tc in cases[:3]:
-                prompt += f"  - {tc.title[:50]} [{tc.test_result}]\n"
-        
-        prompt += "\n单项分析摘要:\n"
-        for analysis in individual_analyses[:5]:
-            prompt += f"\n{analysis['test_case_title'][:40]}:\n{analysis['analysis'][:150]}...\n"
-        
-        prompt += """
-关联分析要点:
-1. 同部件不同错误类型对比
-2. 相似测试一致性
-3. 丝印连续性检查
-4. 测试覆盖度评估
-
-输出:
-**关联问题**: 发现的跨测试问题
-**一致性评估**: 相似测试对比结果
-**风险等级**: 高/中/低
-**建议**: 整体改进建议
-"""
-        
-        try:
-            response = self._call_ollama(prompt, timeout=300)
-            return {'cross_analysis': response, 'component_summary': by_component}
-        except Exception as e:
-            return {'cross_analysis': f'关联分析失败: {str(e)}', 'component_summary': by_component}
-    
-    def _call_ollama(self, prompt: str, timeout: int = 300) -> str:
-        """调用Ollama API"""
+    def call_ollama(self, prompt: str, timeout: int = 300) -> str:
+        """调用Ollama"""
         response = requests.post(
             self.ollama_url,
             json={"model": self.model_name, "prompt": prompt, "stream": False},
             timeout=timeout
         )
-        
         if response.status_code == 200:
             return response.json().get('response', '生成失败')
         raise Exception(f"API错误: {response.status_code}")
-    
-    def generate_comprehensive_report(self, test_cases: List[TestCase],
-                                     individual_analyses: List[Dict],
-                                     cross_analysis: Dict) -> str:
-        """生成综合报告"""
-        report = "# 🔬 BMC RAS功能测试报告 - 深度审查分析\n\n"
-        report += "---\n\n"
-        
-        total_cases = len(test_cases)
-        passed_cases = sum(1 for tc in test_cases if tc.test_result == "PASS")
-        issues_found = sum(1 for a in individual_analyses if a.get('has_issues', False))
-        
-        report += "## 📊 执行摘要\n\n"
-        report += f"- **测试用例总数**: {total_cases}\n"
-        report += f"- **PASS数量**: {passed_cases} ({passed_cases/total_cases*100:.1f}%)\n"
-        report += f"- **发现问题的用例**: {issues_found}\n"
-        report += f"- **问题发现率**: {issues_found/total_cases*100:.1f}%\n\n"
-        
+
+    def extract_structured_info(self, tc: TestCase) -> Dict:
+        """第一轮：提取结构化信息"""
+        prompt = f"""从BMC RAS测试数据中提取关键信息。
+
+测试: {tc.title}
+部件: {tc.component.value}
+错误类型: {tc.error_type.value}
+
+文本:
+{tc.raw_text[:600]}
+
+OCR内容:
+"""
+        for idx, img in enumerate(tc.ocr_images[:2]):
+            prompt += f"\n图{idx + 1}: {img['ocr_data'].get('text', '')[:400]}\n"
+
+        prompt += """
+以JSON格式输出:
+{"registers": {}, "silk_screen": "", "error_log": "", "diagnosis": "", "position": ""}
+"""
+        try:
+            resp = self.call_ollama(prompt, 120)
+            match = re.search(r'\{.*\}', resp, re.DOTALL)
+            return json.loads(match.group()) if match else {'raw': resp}
+        except:
+            return {'error': '提取失败'}
+
+    def analyze_testcase(self, tc: TestCase, info: Dict) -> Dict:
+        """第二轮：分析单个测试"""
+        prompt = f"""审查BMC RAS测试用例。
+
+测试: {tc.title}
+部件: {tc.component.value}
+结果: {tc.test_result}
+
+提取信息:
+{json.dumps(info, indent=2, ensure_ascii=False)}
+
+原文:
+{tc.raw_text[:500]}
+
+检查要点:
+1. 寄存器置位是否正确
+2. 丝印信息是否完整
+3. 诊断结果是否准确
+4. 错误日志是否完整
+5. 部件位置是否准确
+
+输出格式:
+**问题**: (如有)
+- [高/中/低] 具体问题
+**证据**: 数据支持
+**建议**: 改进建议
+
+无问题则输出: "未发现明显问题"
+"""
+        try:
+            resp = self.call_ollama(prompt, 180)
+            return {'title': tc.title, 'analysis': resp, 'has_issues': '未发现明显问题' not in resp}
+        except Exception as e:
+            return {'title': tc.title, 'analysis': f'分析失败: {e}', 'has_issues': False}
+
+    def cross_analysis(self, test_cases: List[TestCase], analyses: List[Dict]) -> Dict:
+        """第三轮：关联分析"""
+        by_comp = {}
+        for tc in test_cases:
+            comp = tc.component.value
+            by_comp.setdefault(comp, []).append(tc)
+
+        prompt = f"""跨测试用例关联分析。
+
+测试总数: {len(test_cases)}
+部件分布: {', '.join(f'{k}: {len(v)}个' for k, v in by_comp.items())}
+
+各部件测试:
+"""
+        for comp, cases in list(by_comp.items())[:5]:
+            prompt += f"\n{comp}:\n"
+            for tc in cases[:3]:
+                prompt += f"  - {tc.title[:40]} [{tc.test_result}]\n"
+
+        prompt += "\n单项分析摘要:\n"
+        for a in analyses[:5]:
+            prompt += f"\n{a['title'][:30]}: {a['analysis'][:120]}...\n"
+
+        prompt += """
+关联分析要点:
+1. 同部件不同错误类型对比
+2. 相似测试一致性
+3. 丝印连续性
+4. 测试覆盖度
+
+输出:
+**关联问题**: 跨测试问题
+**一致性**: 对比结果
+**风险**: 高/中/低
+**建议**: 改进建议
+"""
+        try:
+            resp = self.call_ollama(prompt, 300)
+            return {'analysis': resp, 'summary': by_comp}
+        except Exception as e:
+            return {'analysis': f'失败: {e}', 'summary': by_comp}
+
+    def generate_report(self, test_cases, analyses, cross) -> str:
+        """生成报告"""
+        total = len(test_cases)
+        passed = sum(1 for tc in test_cases if tc.test_result == "PASS")
+        issues = sum(1 for a in analyses if a.get('has_issues', False))
+
+        report = f"""# 🔬 BMC RAS测试报告 - 深度审查分析
+
+## 📊 执行摘要
+
+- 测试用例总数: {total}
+- PASS数量: {passed} ({passed / total * 100:.1f}%)
+- 发现问题用例: {issues}
+- 问题发现率: {issues / total * 100:.1f}%
+
+### 部件测试覆盖度
+
+"""
         comp_stats = {}
         for tc in test_cases:
             comp = tc.component.value
             comp_stats[comp] = comp_stats.get(comp, 0) + 1
-        
-        report += "### 部件测试覆盖度\n\n"
+
         for comp, count in sorted(comp_stats.items()):
             report += f"- **{comp}**: {count} 个测试\n"
-        report += "\n---\n\n"
-        
-        report += "## 🔍 单项测试详细分析\n\n"
-        for idx, analysis in enumerate(individual_analyses, 1):
-            report += f"### {idx}. {analysis['test_case_title']}\n\n"
-            if analysis.get('has_issues'):
-                report += "⚠️ **发现问题**\n\n"
-            else:
-                report += "✅ **通过审查**\n\n"
-            report += f"{analysis['analysis']}\n\n---\n\n"
-        
-        report += "## 🔗 跨测试用例关联分析\n\n"
-        report += cross_analysis.get('cross_analysis', '关联分析未执行')
-        report += "\n\n---\n\n"
-        
+
+        report += "\n---\n\n## 🔍 单项测试详细分析\n\n"
+
+        for idx, a in enumerate(analyses, 1):
+            status = "⚠️ **发现问题**" if a.get('has_issues') else "✅ **通过审查**"
+            report += f"### {idx}. {a['title']}\n\n{status}\n\n{a['analysis']}\n\n---\n\n"
+
+        report += f"## 🔗 跨测试用例关联分析\n\n{cross.get('analysis', '未执行')}\n\n---\n\n"
+
         report += "## 📋 总体结论\n\n"
-        if issues_found > total_cases * 0.3:
+        if issues > total * 0.3:
             report += "⚠️ **风险等级**: 高\n\n"
-        elif issues_found > total_cases * 0.1:
+        elif issues > total * 0.1:
             report += "⚡ **风险等级**: 中\n\n"
         else:
             report += "✅ **风险等级**: 低\n\n"
-        
-        report += "### 建议措施\n\n"
-        report += "1. 复测所有高严重度问题用例\n"
-        report += "2. 补充缺失的测试场景\n"
-        report += "3. 优化测试流程和文档规范\n\n"
-        
+
+        report += """### 建议措施
+
+1. 复测所有高严重度问题用例
+2. 补充缺失的测试场景
+3. 优化测试流程和文档规范
+"""
         return report
 
 
-def process_enhanced_report(docx_file, ollama_model, max_cases, progress=gr.Progress()):
-    """主处理函数"""
-    if docx_file is None:
-        return "❌ 请上传Word测试报告"
-    
-    try:
-        temp_dir = tempfile.mkdtemp()
-        image_dir = os.path.join(temp_dir, "images")
-        
-        progress(0, desc="🚀 初始化...")
-        analyzer = EnhancedTestReportAnalyzer(model_name=ollama_model)
-        
-        progress(0.1, desc="📷 提取图片...")
-        image_list = analyzer.extract_images_from_docx(docx_file.name, image_dir)
-        
-        if not image_list:
-            return "⚠️ 未找到图片"
-        
-        progress(0.2, desc="🔍 OCR识别...")
-        image_paths = [img[0] for img in image_list]
-        ocr_results = analyzer.ocr_images(image_paths, progress)
-        
-        progress(0.4, desc="📋 解析测试用例...")
-        test_cases = analyzer.parse_test_structure(docx_file.name)
-        
-        if not test_cases:
-            return "⚠️ 未识别到测试用例"
-        
-        progress(0.5, desc="🔗 整合数据...")
-        test_cases = analyzer.integrate_ocr_to_testcases(test_cases, image_list, ocr_results)
-        
-        # 限制处理数量
-        test_cases_to_analyze = test_cases[:max_cases]
-        
-        progress(0.6, desc="🧠 提取结构化信息...")
-        structured_infos = []
-        for idx, tc in enumerate(test_cases_to_analyze):
-            progress(0.6 + 0.1 * (idx / len(test_cases_to_analyze)),
-                    desc=f"提取 {idx+1}/{len(test_cases_to_analyze)}")
-            info = analyzer.extract_structured_info(tc)
-            structured_infos.append(info)
-        
-        progress(0.7, desc="🔬 分析单个测试...")
-        individual_analyses = []
-        for idx, (tc, info) in enumerate(zip(test_cases_to_analyze, structured_infos)):
-            progress(0.7 + 0.15 * (idx / len(test_cases_to_analyze)),
-                    desc=f"分析 {idx+1}/{len(test_cases_to_analyze)}")
-            analysis = analyzer.analyze_single_testcase(tc, info)
-            individual_analyses.append(analysis)
-        
-        progress(0.9, desc="🔗 关联分析...")
-        cross_analysis = analyzer.cross_testcase_analysis(test_cases_to_analyze, individual_analyses)
-        
-        progress(0.95, desc="📄 生成报告...")
-        final_report = analyzer.generate_comprehensive_report(
-            test_cases_to_analyze, individual_analyses, cross_analysis)
-        
-        shutil.rmtree(temp_dir)
-        progress(1.0, desc="✅ 完成!")
-        
-        return final_report
-        
-    except Exception as e:
-        error_detail = traceback.format_exc()
-        return f"## ❌ 处理出错\n\n{str(e)}\n\n```\n{error_detail}\n```"
+class AnalyzerThread(QThread):
+    """分析线程"""
+    progress_signal = pyqtSignal(int, str)
+    result_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, doc_path, model, max_cases):
+        super().__init__()
+        self.doc_path = doc_path
+        self.model = model
+        self.max_cases = max_cases
+
+    def run(self):
+        try:
+            temp_dir = tempfile.mkdtemp()
+            img_dir = os.path.join(temp_dir, "images")
+
+            self.progress_signal.emit(0, "🚀 初始化分析器...")
+            analyzer = BMCRASAnalyzer(model_name=self.model)
+
+            self.progress_signal.emit(10, "📷 提取图片...")
+            image_list = analyzer.extract_images_from_docx(self.doc_path, img_dir)
+
+            if not image_list:
+                self.error_signal.emit("未找到图片")
+                return
+
+            self.progress_signal.emit(20, "🔍 OCR识别...")
+            img_paths = [img[0] for img in image_list]
+            ocr_results = analyzer.ocr_images(img_paths)
+
+            self.progress_signal.emit(40, "📋 解析测试用例...")
+            test_cases = analyzer.parse_test_structure(self.doc_path)
+
+            if not test_cases:
+                self.error_signal.emit("未识别到测试用例")
+                return
+
+            self.progress_signal.emit(50, "🔗 整合数据...")
+            test_cases = analyzer.integrate_ocr(test_cases, image_list, ocr_results)
+
+            # 限制数量
+            cases_to_analyze = test_cases[:self.max_cases]
+
+            self.progress_signal.emit(60, "🧠 AI提取信息...")
+            infos = []
+            for idx, tc in enumerate(cases_to_analyze):
+                self.progress_signal.emit(60 + int(10 * idx / len(cases_to_analyze)),
+                                          f"提取 {idx + 1}/{len(cases_to_analyze)}")
+                infos.append(analyzer.extract_structured_info(tc))
+
+            self.progress_signal.emit(70, "🔬 AI分析测试...")
+            analyses = []
+            for idx, (tc, info) in enumerate(zip(cases_to_analyze, infos)):
+                self.progress_signal.emit(70 + int(15 * idx / len(cases_to_analyze)),
+                                          f"分析 {idx + 1}/{len(cases_to_analyze)}")
+                analyses.append(analyzer.analyze_testcase(tc, info))
+
+            self.progress_signal.emit(90, "🔗 关联分析...")
+            cross = analyzer.cross_analysis(cases_to_analyze, analyses)
+
+            self.progress_signal.emit(95, "📄 生成报告...")
+            report = analyzer.generate_report(cases_to_analyze, analyses, cross)
+
+            shutil.rmtree(temp_dir)
+            self.progress_signal.emit(100, "✅ 完成!")
+            self.result_signal.emit(report)
+
+        except Exception as e:
+            self.error_signal.emit(f"处理出错: {str(e)}\n\n{traceback.format_exc()}")
 
 
-def create_ui():
-    with gr.Blocks(title="BMC RAS测试报告深度分析系统", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("""
-        # 🔬 BMC RAS测试报告深度分析系统
-        
-        **三轮AI推理 + 跨测试关联分析**
-        
-        ### 分析流程:
-        1. **OCR识别** → 提取图片中的寄存器、丝印、日志
-        2. **结构化提取** → AI第一轮：提取关键字段
-        3. **单项分析** → AI第二轮：审查每个测试用例
-        4. **关联分析** → AI第三轮：跨测试用例对比
-        5. **综合报告** → 生成问题清单和改进建议
+class MainWindow(QMainWindow):
+    """主窗口"""
+
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        self.analyzer_thread = None
+        self.doc_path = None
+
+    def init_ui(self):
+        self.setWindowTitle("🔬 BMC RAS测试报告深度分析系统")
+        self.setGeometry(100, 100, 1400, 900)
+
+        # 主widget
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+
+        # 左侧控制面板
+        left_panel = self.create_control_panel()
+
+        # 右侧结果区域
+        right_panel = self.create_result_panel()
+
+        # 分割器
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+
+        main_layout.addWidget(splitter)
+
+        # 状态栏
+        self.statusBar().showMessage("就绪")
+
+        # 样式
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #cccccc;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 2px solid #ddd;
+                border-radius: 4px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #4CAF50;
+            }
         """)
-        
-        with gr.Row():
-            with gr.Column(scale=1):
-                docx_input = gr.File(
-                    label="📄 上传测试报告 (.docx)",
-                    file_types=[".docx"],
-                    type="filepath"
-                )
-                
-                model_input = gr.Textbox(
-                    label="🤖 Ollama模型",
-                    value="qwen2.5:7b",
-                    placeholder="qwen2.5:7b, deepseek-r1:7b"
-                )
-                
-                max_cases_input = gr.Slider(
-                    label="最大分析用例数",
-                    minimum=5,
-                    maximum=50,
-                    value=10,
-                    step=5,
-                    info="分析前N个测试用例（更多用例需要更长时间）"
-                )
-                
-                analyze_btn = gr.Button("🚀 开始深度分析", variant="primary", size="lg")
-                
-                gr.Markdown("""
-                ### ⚙️ 系统要求:
-                - ✅ Ollama运行中 (`ollama serve`)
-                - ✅ 模型已下载 (`ollama pull qwen2.5:7b`)
-                - ✅ Python依赖已安装
-                
-                ### 🎯 分析重点:
-                - 🔍 寄存器置位正确性
-                - 📌 丝印信息完整性
-                - 📊 诊断结果准确性
-                - 🔗 跨测试一致性对比
-                - 📈 部件测试覆盖度
-                - ⚠️ 边界条件检查
-                """)
-            
-            with gr.Column(scale=2):
-                output = gr.Markdown(
-                    label="分析报告",
-                    value="⏳ 等待上传文件..."
-                )
-        
-        analyze_btn.click(
-            fn=process_enhanced_report,
-            inputs=[docx_input, model_input, max_cases_input],
-            outputs=output
+
+    def create_control_panel(self):
+        """创建控制面板"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        # 标题
+        title = QLabel("🔬 BMC RAS分析系统")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        # 文件选择组
+        file_group = QGroupBox("📄 测试报告")
+        file_layout = QVBoxLayout()
+
+        self.file_label = QLabel("未选择文件")
+        self.file_label.setWordWrap(True)
+        self.file_label.setStyleSheet("padding: 5px; background: white; border-radius: 3px;")
+        file_layout.addWidget(self.file_label)
+
+        select_btn = QPushButton("📁 选择Word文档")
+        select_btn.clicked.connect(self.select_file)
+        file_layout.addWidget(select_btn)
+
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
+
+        # 模型配置组
+        model_group = QGroupBox("🤖 模型配置")
+        model_layout = QVBoxLayout()
+
+        model_layout.addWidget(QLabel("Ollama模型:"))
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(["qwen3:8b", "qwen2.5:7b", "deepseek-r1:7b", "llama3.1:8b"])
+        self.model_combo.setEditable(True)
+        model_layout.addWidget(self.model_combo)
+
+        model_layout.addWidget(QLabel("最大分析用例数:"))
+        self.max_cases_spin = QSpinBox()
+        self.max_cases_spin.setRange(5, 50)
+        self.max_cases_spin.setValue(10)
+        self.max_cases_spin.setSuffix(" 个")
+        model_layout.addWidget(self.max_cases_spin)
+
+        model_group.setLayout(model_layout)
+        layout.addWidget(model_group)
+
+        # 进度组
+        progress_group = QGroupBox("📊 分析进度")
+        progress_layout = QVBoxLayout()
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        progress_layout.addWidget(self.progress_bar)
+
+        self.progress_label = QLabel("等待开始...")
+        self.progress_label.setWordWrap(True)
+        progress_layout.addWidget(self.progress_label)
+
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+
+        # 开始按钮
+        self.start_btn = QPushButton("🚀 开始深度分析")
+        self.start_btn.setMinimumHeight(50)
+        self.start_btn.clicked.connect(self.start_analysis)
+        self.start_btn.setEnabled(False)
+        layout.addWidget(self.start_btn)
+
+        # 说明
+        info_group = QGroupBox("ℹ️ 系统说明")
+        info_layout = QVBoxLayout()
+
+        info_text = QTextEdit()
+        info_text.setReadOnly(True)
+        info_text.setMaximumHeight(250)
+        info_text.setHtml("""
+<b>分析流程:</b><br>
+1. <b>OCR识别</b> → 提取寄存器、丝印、日志<br>
+2. <b>结构化提取</b> → AI第一轮提取<br>
+3. <b>单项分析</b> → AI第二轮审查<br>
+4. <b>关联分析</b> → AI第三轮对比<br>
+5. <b>综合报告</b> → 生成问题清单<br><br>
+
+<b>审查重点:</b><br>
+✓ 寄存器置位正确性<br>
+✓ 丝印信息完整性<br>
+✓ 诊断结果准确性<br>
+✓ 跨测试一致性<br>
+✓ 部件测试覆盖度<br><br>
+
+<b>系统要求:</b><br>
+• Ollama运行在本地<br>
+• 模型已下载<br>
+• Word文档格式正确<br>
+        """)
+        info_layout.addWidget(info_text)
+
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        layout.addStretch()
+        return panel
+
+    def create_result_panel(self):
+        """创建结果面板"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        # 标签栏
+        self.tab_widget = QTabWidget()
+
+        # 分析报告标签
+        self.report_text = QTextEdit()
+        self.report_text.setReadOnly(True)
+        self.report_text.setPlaceholderText("分析报告将在此显示...")
+
+        # 设置等宽字体
+        font = QFont("Consolas", 10)
+        self.report_text.setFont(font)
+
+        self.tab_widget.addTab(self.report_text, "📄 分析报告")
+
+        # 日志标签
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(200)
+        log_font = QFont("Courier", 9)
+        self.log_text.setFont(log_font)
+
+        self.tab_widget.addTab(self.log_text, "📝 运行日志")
+
+        layout.addWidget(self.tab_widget)
+
+        # 操作按钮
+        button_layout = QHBoxLayout()
+
+        self.save_btn = QPushButton("💾 保存报告")
+        self.save_btn.clicked.connect(self.save_report)
+        self.save_btn.setEnabled(False)
+        button_layout.addWidget(self.save_btn)
+
+        self.copy_btn = QPushButton("📋 复制报告")
+        self.copy_btn.clicked.connect(self.copy_report)
+        self.copy_btn.setEnabled(False)
+        button_layout.addWidget(self.copy_btn)
+
+        self.clear_btn = QPushButton("🗑️ 清空")
+        self.clear_btn.clicked.connect(self.clear_results)
+        button_layout.addWidget(self.clear_btn)
+
+        layout.addLayout(button_layout)
+
+        return panel
+
+    def select_file(self):
+        """选择文件"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择测试报告",
+            "",
+            "Word文档 (*.docx)"
         )
-        
-        gr.Markdown("""
-        ---
-        ### 💡 使用建议:
-        - 首次运行需下载OCR模型，约5-10分钟
-        - 建议使用7B以上模型以获得更准确的分析
-        - 完整分析时间：10个用例约10-15分钟
-        - 报告会标注问题严重程度（高/中/低）
-        
-        ### 🔧 故障排查:
-        ```bash
-        # 检查Ollama服务
-        ollama serve
-        
-        # 检查模型列表
-        ollama list
-        
-        # 拉取推荐模型
-        ollama pull qwen2.5:7b
-        ```
-        """)
-    
-    return demo
+
+        if file_path:
+            self.doc_path = file_path
+            self.file_label.setText(f"📄 {Path(file_path).name}")
+            self.start_btn.setEnabled(True)
+            self.log(f"✓ 已选择文件: {file_path}")
+
+    def start_analysis(self):
+        """开始分析"""
+        if not self.doc_path:
+            QMessageBox.warning(self, "警告", "请先选择测试报告文件!")
+            return
+
+        model = self.model_combo.currentText()
+        max_cases = self.max_cases_spin.value()
+
+        # 禁用按钮
+        self.start_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.copy_btn.setEnabled(False)
+
+        # 清空结果
+        self.report_text.clear()
+        self.progress_bar.setValue(0)
+
+        self.log(f"开始分析，模型: {model}, 最大用例数: {max_cases}")
+
+        # 创建并启动线程
+        self.analyzer_thread = AnalyzerThread(self.doc_path, model, max_cases)
+        self.analyzer_thread.progress_signal.connect(self.update_progress)
+        self.analyzer_thread.result_signal.connect(self.show_result)
+        self.analyzer_thread.error_signal.connect(self.show_error)
+        self.analyzer_thread.start()
+
+    def update_progress(self, value, message):
+        """更新进度"""
+        self.progress_bar.setValue(value)
+        self.progress_label.setText(message)
+        self.log(f"[{value}%] {message}")
+
+    def show_result(self, report):
+        """显示结果"""
+        self.report_text.setPlainText(report)
+        self.save_btn.setEnabled(True)
+        self.copy_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self.log("✓ 分析完成!")
+        self.statusBar().showMessage("分析完成", 5000)
+        QMessageBox.information(self, "完成", "分析已完成，请查看报告!")
+
+    def show_error(self, error):
+        """显示错误"""
+        self.report_text.setPlainText(f"❌ 错误:\n\n{error}")
+        self.start_btn.setEnabled(True)
+        self.log(f"✗ 错误: {error}")
+        QMessageBox.critical(self, "错误", f"分析失败:\n{error[:200]}...")
+
+    def save_report(self):
+        """保存报告"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存分析报告",
+            "BMC_RAS_分析报告.md",
+            "Markdown (*.md);;文本文件 (*.txt)"
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(self.report_text.toPlainText())
+                self.log(f"✓ 报告已保存: {file_path}")
+                QMessageBox.information(self, "成功", "报告已保存!")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"保存失败: {e}")
+
+    def copy_report(self):
+        """复制报告"""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.report_text.toPlainText())
+        self.log("✓ 报告已复制到剪贴板")
+        self.statusBar().showMessage("已复制到剪贴板", 3000)
+
+    def clear_results(self):
+        """清空结果"""
+        self.report_text.clear()
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("等待开始...")
+        self.log("已清空结果")
+
+    def log(self, message):
+        """添加日志"""
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("BMC RAS分析系统")
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    demo = create_ui()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        inbrowser=True
-    )
+    main()
